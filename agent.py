@@ -3,14 +3,17 @@ import sqlite3
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.sqlite import SqliteSaver
 from pydantic import SecretStr
 
-load_dotenv()
-from langgraph.checkpoint.sqlite import SqliteSaver
+from memory_db import search_memories
+from prompts.system_prompt import SYSTEM_PROMPT
+from prompts.thread_summary_prompt import THREAD_SUMMARY_PROMPT
 
-from memory_db import get_memories, save_memory
+load_dotenv()
 
 
 def _build_llm() -> ChatOpenAI:
@@ -20,56 +23,181 @@ def _build_llm() -> ChatOpenAI:
     )
 
 
-# One shared connection for the checkpointer, reused across requests
-_THREADS_CONN = sqlite3.connect("threads.db", check_same_thread=False)
+# Persistent conversation history.
+_THREADS_CONN = sqlite3.connect(
+    "threads.db",
+    check_same_thread=False,
+)
 _CHECKPOINTER = SqliteSaver(_THREADS_CONN)
 _CHECKPOINTER.setup()
 
 
-def _make_remember_tool(user_id: str):
-    """Factory that binds the current user_id into the tool via a closure."""
+def _init_thread_titles() -> None:
+    """Create persistent storage for conversation titles."""
+    with _THREADS_CONN:
+        _THREADS_CONN.execute(
+            """
+            CREATE TABLE IF NOT EXISTS thread_titles (
+                thread_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL
+            )
+            """
+        )
+
+
+def _make_remember_tool(pending_memories: list[str]):
+    """Propose facts without saving them automatically."""
 
     @tool
     def remember(fact: str) -> str:
-        """Save a personal fact about the user to long-term memory.
+        """Propose a personal fact for user confirmation."""
+        fact = fact.strip()
 
-        Call this whenever the user tells you something worth keeping
-        between conversations (food preferences, location, goals, name,
-        allergies, and so on).
-        """
-        save_memory(user_id, fact)
-        return f"Saved to long-term memory: {fact}"
+        if fact and fact not in pending_memories:
+            pending_memories.append(fact)
+
+        return (
+            "The fact is pending user confirmation and has not been saved. "
+            "Continue responding naturally and tell the user they can "
+            "confirm or cancel the proposed memory in the application."
+        )
 
     return remember
 
 
-def build_agent(user_id: str):
-    """Return a fresh agent with the current user's memories loaded into its prompt."""
-    memories = get_memories(user_id)
-    memory_bullets = "\n".join(f"- {m}" for m in memories) or "(nothing yet)"
+def build_agent(
+    user_id: str,
+    user_message: str,
+    pending_memories: list[str] | None = None,
+):
+    """Build an agent with memories relevant to the current message."""
+    if pending_memories is None:
+        pending_memories = []
 
-    system_prompt = (
-        "You are a helpful assistant with long-term memory.\n\n"
-        f"What you remember about this user:\n{memory_bullets}\n\n"
-        "IMPORTANT: You have no persistent memory of your own — your context "
-        "window is erased between sessions. Whenever the user tells you "
-        "anything personal (preferences, dietary needs, location, goals, name, "
-        "allergies, or any fact they want recalled later), you MUST call the "
-        "`remember` tool immediately. Do not say 'I'll remember that' without "
-        "calling the tool; saying it does not save anything."
+    memories = search_memories(
+        user_id=user_id,
+        query=user_message,
+        limit=5,
+    )
 
-        "Use the saved memories above when answering the user's questions. "
-        "Personalize recommendations using relevant preferences and "
-        "dietary restrictions already stored. Do not ask the user to repeat "
-        "information that is already available in memory. For food "
-        "recommendations, always respect any saved allergies and dietary "
-        "preferences.\n\n"
+    memory_bullets = (
+        "\n".join(f"- {fact}" for fact in memories)
+        if memories
+        else "(no relevant memories found)"
+    )
 
+    system_prompt = SYSTEM_PROMPT.format(
+        memory_bullets=memory_bullets,
     )
 
     return create_agent(
         model=_build_llm(),
-        tools=[_make_remember_tool(user_id)],
+        tools=[_make_remember_tool(pending_memories)],
         system_prompt=system_prompt,
         checkpointer=_CHECKPOINTER,
     )
+
+
+def summarise_thread(thread_id: str) -> str:
+    """Generate and persist a concise conversation title."""
+    _init_thread_titles()
+
+    saved_title = _THREADS_CONN.execute(
+        "SELECT title FROM thread_titles WHERE thread_id = ?",
+        (thread_id,),
+    ).fetchone()
+
+    if saved_title:
+        return saved_title[0]
+
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    checkpoint_tuple = _CHECKPOINTER.get_tuple(config)
+
+    if checkpoint_tuple is None:
+        return "New conversation"
+
+    messages = checkpoint_tuple.checkpoint.get("channel_values", {}).get("messages", [])
+
+    conversation_parts = []
+
+    for message in messages:
+        role = getattr(message, "type", "")
+        content = getattr(message, "content", "")
+
+        if role not in ("human", "ai"):
+            continue
+
+        if not isinstance(content, str) or not content.strip():
+            continue
+
+        label = "User" if role == "human" else "Assistant"
+        conversation_parts.append(f"{label}: {content}")
+
+    if not conversation_parts:
+        return "New conversation"
+
+    conversation = "\n".join(conversation_parts)
+
+    response = _build_llm().invoke(
+        THREAD_SUMMARY_PROMPT.format(conversation=conversation)
+    )
+
+    title = str(response.content).strip().strip('"').strip("'")
+    title = title or "Untitled conversation"
+
+    with _THREADS_CONN:
+        _THREADS_CONN.execute(
+            """
+            INSERT OR REPLACE INTO thread_titles (thread_id, title)
+            VALUES (?, ?)
+            """,
+            (thread_id, title),
+        )
+
+    return title
+
+
+def list_thread_ids(limit: int = 10) -> list[str]:
+    """Return the most recently updated conversation threads."""
+    rows = _THREADS_CONN.execute(
+        """
+        SELECT thread_id, MAX(rowid) AS latest
+        FROM checkpoints
+        WHERE checkpoint_ns = ''
+        GROUP BY thread_id
+        ORDER BY latest DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+    return [row[0] for row in rows]
+
+
+def load_thread_messages(thread_id: str) -> list[dict[str, str]]:
+    """Load displayable messages when reopening a conversation."""
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    checkpoint_tuple = _CHECKPOINTER.get_tuple(config)
+
+    if checkpoint_tuple is None:
+        return []
+
+    messages = checkpoint_tuple.checkpoint.get("channel_values", {}).get("messages", [])
+
+    history = []
+
+    for message in messages:
+        role = getattr(message, "type", "")
+        content = getattr(message, "content", "")
+
+        if role == "human":
+            display_role = "user"
+        elif role == "ai":
+            display_role = "assistant"
+        else:
+            continue
+
+        if isinstance(content, str) and content.strip():
+            history.append({"role": display_role, "content": content})
+
+    return history
